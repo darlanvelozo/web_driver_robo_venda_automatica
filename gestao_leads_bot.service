@@ -1,0 +1,31 @@
+[Unit]
+Description=Bot de Gestão de Leads - Conversão Automática
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=darlan
+Group=darlan
+WorkingDirectory=/home/darlan/web_driver_conversao_lead
+Environment=PATH=/home/darlan/web_driver_conversao_lead/myenv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=VIRTUAL_ENV=/home/darlan/web_driver_conversao_lead/myenv
+Environment=PYTHONPATH=/home/darlan/web_driver_conversao_lead
+ExecStart=/home/darlan/web_driver_conversao_lead/myenv/bin/python /home/darlan/web_driver_conversao_lead/gestao_leads/main_leads.py
+Restart=always
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=gestao-leads-bot
+
+# Configurações de segurança
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Configurações de recursos
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target 
