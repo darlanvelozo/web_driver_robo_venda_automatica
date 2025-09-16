@@ -13,8 +13,10 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 import logging
 import psycopg2
+from psycopg2.extras import Json
 import tempfile
 import shutil
+import json
 
 # Configurar logging apenas para erros
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Carregar variáveis do arquivo .env
 load_dotenv()
 
-# Configurações do banco de dados
+# Configurações do banco de dados (PRIMÁRIO - já existente)
 DB_CONFIG = {
     'host': '187.62.153.52',
     'database': 'robo_venda_automatica',
@@ -32,8 +34,21 @@ DB_CONFIG = {
     'port': 5432
 }
 
+# Configuração do banco de dados SECUNDÁRIO (Django)
+DB_CONFIG_DJANGO = {
+    'host': '187.62.153.52',
+    'database': 'venda_automatica_django',
+    'user': 'admin',
+    'password': 'qualidade@trunks.57',
+    'port': 5432
+}
+
 class ProspectoProcessor:
     def __init__(self):
+        # Conexões separadas para permitir replicação sem quebrar o fluxo atual
+        self.conn_primary = None
+        self.conn_secondary = None
+        # Backward-compat: manter atributo "conn" apontando para o primário
         self.conn = None
         self.screenshots_dir = "screenshots"
         self.start_time = None
@@ -46,21 +61,39 @@ class ProspectoProcessor:
             os.makedirs(self.screenshots_dir)
     
     def conectar_banco(self):
-        """Conecta ao banco de dados PostgreSQL"""
+        """Conecta aos bancos de dados (primário e secundário)."""
         try:
-            self.conn = psycopg2.connect(**DB_CONFIG)
+            self.conn_primary = psycopg2.connect(**DB_CONFIG)
+            # Secundário não deve interromper a produção caso falhe; logar e seguir
+            try:
+                self.conn_secondary = psycopg2.connect(**DB_CONFIG_DJANGO)
+            except Exception as e_sec:
+                logger.error(f"Falha ao conectar no banco secundário (Django): {e_sec}")
+                self.conn_secondary = None
+
+            # Compatibilidade: manter self.conn usado em trechos existentes
+            self.conn = self.conn_primary
             return True
         except Exception as e:
-            logger.error(f"Erro ao conectar ao banco: {e}")
+            logger.error(f"Erro ao conectar ao banco primário: {e}")
             return False
     
     def desconectar_banco(self):
-        """Desconecta do banco de dados"""
-        if self.conn:
-            self.conn.close()
+        """Desconecta dos bancos de dados."""
+        try:
+            if self.conn_primary:
+                self.conn_primary.close()
+        finally:
+            self.conn_primary = None
+            self.conn = None
+        if self.conn_secondary:
+            try:
+                self.conn_secondary.close()
+            finally:
+                self.conn_secondary = None
     
     def salvar_prospecto(self, nome_prospecto, id_prospecto_hubsoft, status_atual, erro=None, resultado=None):
-        """Salva ou atualiza dados do prospecto no banco"""
+        """Salva ou atualiza dados do prospecto no banco primário e replica para o secundário."""
         if not self.conn:
             return False
         
@@ -93,6 +126,8 @@ class ProspectoProcessor:
             }
             
             status_db = status_mapping.get(status_atual, "erro")
+            # Para o banco Django, 'finalizado' deve virar 'aguardando_validacao'
+            status_django = "aguardando_validacao" if status_db == "finalizado" else status_db
             
             # VERIFICAÇÃO CRÍTICA: Só permite "finalizado" se for realmente CONCLUIDO com sucesso
             if status_db == "finalizado" and resultado != "sucesso":
@@ -170,6 +205,102 @@ class ProspectoProcessor:
             
             self.conn.commit()
             cursor.close()
+
+            # Replicar alterações no banco secundário (Django)
+            try:
+                if self.conn_secondary:
+                    sec_cursor = self.conn_secondary.cursor()
+                    # Converter resultado para JSONB quando aplicável
+                    resultado_jsonb = Json(resultado) if resultado is not None else None
+
+                    # Verificar existência no secundário
+                    sec_cursor.execute(
+                        "SELECT id FROM prospectos WHERE id_prospecto_hubsoft = %s",
+                        (id_prospecto_hubsoft,)
+                    )
+                    sec_row = sec_cursor.fetchone()
+
+                    if sec_row:
+                        sec_id = sec_row[0]
+                        sec_cursor.execute(
+                            """
+                            UPDATE prospectos SET
+                                nome_prospecto = %s,
+                                status = %s,
+                                data_processamento = %s,
+                                tentativas_processamento = %s,
+                                erro_processamento = %s,
+                                tempo_processamento = %s,
+                                resultado_processamento = %s
+                            WHERE id = %s
+                            """,
+                            (
+                                nome_prospecto,
+                                status_django,
+                                datetime.datetime.now(),
+                                self.tentativa_atual,
+                                erro,
+                                tempo_processamento,
+                                resultado_jsonb,
+                                sec_id,
+                            ),
+                        )
+                    else:
+                        # Inserir preenchendo campos obrigatórios do modelo Django
+                        sec_cursor.execute(
+                            """
+                            INSERT INTO prospectos (
+                                nome_prospecto,
+                                id_prospecto_hubsoft,
+                                status,
+                                data_criacao,
+                                data_processamento,
+                                tentativas_processamento,
+                                tempo_processamento,
+                                erro_processamento,
+                                prioridade,
+                                dados_processamento,
+                                resultado_processamento,
+                                lead_id,
+                                data_fim_processamento,
+                                data_inicio_processamento,
+                                score_conversao,
+                                usuario_processamento
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            )
+                            """,
+                            (
+                                nome_prospecto,
+                                id_prospecto_hubsoft,
+                                status_django,
+                                datetime.datetime.now(),
+                                datetime.datetime.now(),
+                                self.tentativa_atual,
+                                tempo_processamento,
+                                erro,
+                                1,  # prioridade default
+                                None,  # dados_processamento
+                                resultado_jsonb,
+                                None,  # lead_id
+                                None,  # data_fim_processamento
+                                None,  # data_inicio_processamento
+                                None,  # score_conversao
+                                None,  # usuario_processamento
+                            ),
+                        )
+
+                    self.conn_secondary.commit()
+                    sec_cursor.close()
+            except Exception as e_sec:
+                # Não interromper processamento caso o secundário falhe
+                logger.error(f"Falha ao replicar no banco secundário: {e_sec}")
+                try:
+                    if self.conn_secondary:
+                        self.conn_secondary.rollback()
+                except Exception:
+                    pass
+
             return True
             
         except Exception as e:
@@ -466,6 +597,18 @@ def main(nome_filtro=None, id_prospecto=None):
         # ETAPA 6: Wizard - Primeira tela
         try:
             print("📋 ETAPA 6: Preenchendo wizard (1/4)...")
+            
+            # Selecionar opção no campo md-select
+            print("🔽 Selecionando opção no campo...")
+            md_select_campo = wait.until(EC.element_to_be_clickable((By.XPATH, "/html/body/div[5]/md-dialog/md-dialog-content/div/hubsoft-cliente-wizard/div[1]/div/hubsoft-accordion/div[2]/hubsoft-accordion-content/div/form/div/div[6]/md-input-container[1]/md-select")))
+            driver.execute_script("arguments[0].click();", md_select_campo)
+            time.sleep(1)
+            
+            # Selecionar primeira opção
+            opcao_campo = wait.until(EC.element_to_be_clickable((By.XPATH, "/html/body/div[7]/md-select-menu/md-content/md-option[1]")))
+            driver.execute_script("arguments[0].click();", opcao_campo)
+            time.sleep(1)
+            
             # Primeiro botão
             primeiro_botao = wait.until(EC.element_to_be_clickable((By.XPATH, "/html/body/div[5]/md-dialog/md-dialog-content/div/hubsoft-cliente-wizard/div[2]/md-dialog-actions/div[2]/button")))
             driver.execute_script("arguments[0].click();", primeiro_botao)
